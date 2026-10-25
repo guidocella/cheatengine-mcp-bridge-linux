@@ -13,15 +13,31 @@ Enhanced test suite with:
 This test suite is designed to give 100% confidence in MCP bridge reliability.
 """
 
-import win32file
+import os
+import socket
 import struct
 import json
 import time
 import sys
 from typing import Optional, Dict, Any, Tuple, List, Callable
 
+try:
+    import win32file
+except ImportError:
+    win32file = None
+
 PIPE_NAME = r"\\.\pipe\CE_MCP_Bridge_v99"
+# Same knobs as mcp_cheatengine.py: named pipe on Windows, TCP (native Linux/macOS CE) elsewhere.
+TRANSPORT = (os.environ.get("CE_MCP_TRANSPORT") or ("pipe" if sys.platform == "win32" else "tcp")).strip().lower()
+TCP_HOST = os.environ.get("CE_MCP_HOST", "127.0.0.1")
+TCP_PORT = int(os.environ.get("CE_MCP_PORT", "9876"))
 MAX_RESPONSE_BYTES = 32 * 1024 * 1024
+# Module images start with a PE header on Windows; native Linux CE attaches to ELF processes.
+if sys.platform == "win32":
+    IMAGE_MAGIC, IMAGE_MAGIC_TEXT = b"MZ\x90\x00", "MZ"
+else:
+    IMAGE_MAGIC, IMAGE_MAGIC_TEXT = b"\x7fELF", "ELF"
+IMAGE_MAGIC_AOB = " ".join(f"{b:02X}" for b in IMAGE_MAGIC)
 EXPECTED_VERSION_PREFIX = "12."
 
 class TestResult:
@@ -32,9 +48,18 @@ class TestResult:
 class MCPTestClient:
     def __init__(self):
         self.handle = None
+        self.sock = None
         self.request_id = 0
         
     def connect(self) -> bool:
+        if TRANSPORT == "tcp":
+            try:
+                self.sock = socket.create_connection((TCP_HOST, TCP_PORT))
+                print(f"✓ Connected to {TCP_HOST}:{TCP_PORT}")
+                return True
+            except Exception as e:
+                print(f"✗ Connection failed: {e}")
+                return False
         try:
             self.handle = win32file.CreateFile(
                 PIPE_NAME,
@@ -48,9 +73,27 @@ class MCPTestClient:
         except Exception as e:
             print(f"✗ Connection failed: {e}")
             return False
+
+    def _write(self, data: bytes):
+        if self.sock:
+            self.sock.sendall(data)
+        else:
+            win32file.WriteFile(self.handle, data)
+
+    def _read(self, size: int) -> bytes:
+        if not self.sock:
+            return win32file.ReadFile(self.handle, size)[1]
+        chunks = []
+        while size > 0:
+            chunk = self.sock.recv(size)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size -= len(chunk)
+        return b"".join(chunks)
     
     def send_command(self, method: str, params: Optional[dict] = None) -> dict:
-        if not self.handle:
+        if not self.handle and not self.sock:
             raise RuntimeError("Not connected to MCP bridge")
 
         if params is None:
@@ -66,10 +109,10 @@ class MCPTestClient:
         
         data = json.dumps(request).encode('utf-8')
         header = struct.pack('<I', len(data))
-        win32file.WriteFile(self.handle, header)
-        win32file.WriteFile(self.handle, data)
+        self._write(header)
+        self._write(data)
         
-        _, resp_header = win32file.ReadFile(self.handle, 4)
+        resp_header = self._read(4)
         if len(resp_header) < 4:
             raise RuntimeError("Incomplete response header from bridge")
 
@@ -77,7 +120,7 @@ class MCPTestClient:
         if resp_len <= 0 or resp_len > MAX_RESPONSE_BYTES:
             raise RuntimeError(f"Invalid response length: {resp_len}")
 
-        _, resp_data = win32file.ReadFile(self.handle, resp_len)
+        resp_data = self._read(resp_len)
         if len(resp_data) < resp_len:
             raise RuntimeError(f"Incomplete response body: expected {resp_len}, got {len(resp_data)}")
 
@@ -87,6 +130,9 @@ class MCPTestClient:
             raise RuntimeError(f"Invalid JSON response: {e}") from e
     
     def close(self):
+        if self.sock:
+            self.sock.close()
+            self.sock = None
         if self.handle:
             win32file.CloseHandle(self.handle)
             self.handle = None
@@ -286,15 +332,16 @@ def bytes_match_pattern(bytes_field: str, data_field: str):
     return validator
 
 def mz_header_check():
-    """Validator: First two bytes are 'MZ' (0x4D, 0x5A) for PE header"""
+    """Validator: First two bytes are the image magic ('MZ' for PE, '\\x7fE' for ELF)"""
     def validator(resp):
         if "bytes" not in resp:
             return False, "Missing 'bytes' field"
         bytes_arr = resp["bytes"]
         if len(bytes_arr) < 2:
-            return False, "Not enough bytes to check MZ header"
-        if bytes_arr[0] != 0x4D or bytes_arr[1] != 0x5A:
-            return False, f"Expected MZ header (4D 5A), got {bytes_arr[0]:02X} {bytes_arr[1]:02X}"
+            return False, "Not enough bytes to check image header"
+        if bytes_arr[0] != IMAGE_MAGIC[0] or bytes_arr[1] != IMAGE_MAGIC[1]:
+            return False, (f"Expected image header ({IMAGE_MAGIC[0]:02X} {IMAGE_MAGIC[1]:02X}), "
+                           f"got {bytes_arr[0]:02X} {bytes_arr[1]:02X}")
         return True, ""
     return validator
 
@@ -450,8 +497,8 @@ def main():
     )
     
     all_tests["aob_scan"] = TestCase(
-        "AOB Scan (MZ header)", "aob_scan",
-        params={"pattern": "4D 5A 90 00", "limit": 5},
+        f"AOB Scan ({IMAGE_MAGIC_TEXT} header)", "aob_scan",
+        params={"pattern": IMAGE_MAGIC_AOB, "limit": 5},
         validators=[
             has_field("success", bool),
             has_field("count", int),
@@ -521,26 +568,26 @@ def main():
     )
     
     all_tests["read_integer_byte"] = TestCase(
-        "Read Integer (byte) - should be 0x4D (M)", "read_integer",
+        f"Read Integer (byte) - should be 0x{IMAGE_MAGIC[0]:02X}", "read_integer",
         params={"address": module_base, "type": "byte"},
         validators=[
             has_field("success", bool),
             field_equals("success", True),
             has_field("value", int),
-            field_equals("value", 0x4D),  # 'M' from MZ header
+            field_equals("value", IMAGE_MAGIC[0]),  # 'M' from MZ header / 0x7F from ELF
             has_field("type", str),
             field_equals("type", "byte"),
         ]
     )
     
     all_tests["read_integer_word"] = TestCase(
-        "Read Integer (word) - should be 0x5A4D (ZM little-endian)", "read_integer",
+        "Read Integer (word) - first two header bytes, little-endian", "read_integer",
         params={"address": module_base, "type": "word"},
         validators=[
             has_field("success", bool),
             field_equals("success", True),
             has_field("value", int),
-            field_equals("value", 0x5A4D),  # MZ in little-endian
+            field_equals("value", int.from_bytes(IMAGE_MAGIC[:2], "little")),  # MZ / \x7fE in little-endian
             has_field("type", str),
             field_equals("type", "word"),
         ]
@@ -559,15 +606,15 @@ def main():
     )
     
     all_tests["read_string"] = TestCase(
-        "Read String (MZ header)", "read_string",
+        f"Read String ({IMAGE_MAGIC_TEXT} header)", "read_string",
         params={"address": module_base, "max_length": 32},
         validators=[
             has_field("success", bool),
             field_equals("success", True),
             has_field("value", str),
-            # Value should start with "MZ" or contain it
-            lambda r: ("MZ" in r.get("value", "") or r["value"].startswith("MZ"), 
-                      f"Expected 'MZ' in value, got '{r.get('value')}'"),
+            # Value should contain "MZ" (PE) / "ELF" (ELF)
+            lambda r: (IMAGE_MAGIC_TEXT in r.get("value", ""),
+                      f"Expected '{IMAGE_MAGIC_TEXT}' in value, got '{r.get('value')}'"),
         ]
     )
     
@@ -585,7 +632,16 @@ def main():
     # For disassembly, use a CODE address (entry point), not header data
     # Read PE header to find entry point
     entry_point = None
-    pe_offset_result = client.send_command("read_integer", {"address": module_base + 0x3C, "type": "dword"})
+    if IMAGE_MAGIC_TEXT == "ELF":
+        # ELF: e_entry at 0x18, pointer-sized per EI_CLASS (byte 4: 1=32-bit, 2=64-bit); PIE stores it base-relative
+        class_result = client.send_command("read_integer", {"address": module_base + 4, "type": "byte"})
+        entry_type = "qword" if class_result.get("result", {}).get("value") == 2 else "dword"
+        entry_result = client.send_command("read_integer", {"address": module_base + 0x18, "type": entry_type})
+        if entry_result.get("result", {}).get("success"):
+            e_entry = entry_result["result"]["value"]
+            entry_point = e_entry if e_entry >= module_base else module_base + e_entry
+            print(f"[Found entry point at {hex(entry_point)}]")
+    pe_offset_result = client.send_command("read_integer", {"address": module_base + 0x3C, "type": "dword"}) if not entry_point else {}
     if pe_offset_result.get("result", {}).get("success"):
         pe_offset = pe_offset_result["result"]["value"]
         entry_rva_result = client.send_command("read_integer", {"address": module_base + pe_offset + 0x28, "type": "dword"})

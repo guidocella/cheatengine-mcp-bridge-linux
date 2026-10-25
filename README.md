@@ -93,7 +93,7 @@ pip install mcp pywin32
 ```
 
 > [!NOTE]
-> Native pipe mode is **Windows only** because it uses Named Pipes (`pywin32`). Use TCP relay transport when the MCP server runs outside the Windows environment that hosts Cheat Engine and cannot open the named pipe directly.
+> Native pipe mode is **Windows only** because it uses Named Pipes (`pywin32`). On the native **Linux** build of Cheat Engine the bridge listens on a localhost TCP socket instead, see [Native Linux Cheat Engine](#native-linux-cheat-engine). Use TCP relay transport when the MCP server runs outside the Windows environment that hosts Cheat Engine and cannot open the named pipe directly.
 
 ---
 
@@ -178,6 +178,43 @@ For MCP client configs that support environment variables:
 ```
 
 Set `--host` on the relay and `CE_MCP_HOST` on the MCP server to addresses that match your network setup. Keep the relay bound to trusted interfaces only, because anyone who can reach it can control the Cheat Engine bridge.
+
+#### Native Linux Cheat Engine
+
+The native Linux build of Cheat Engine (7.6+) has no named pipes, so when `ce_mcp_bridge.lua` runs there it listens on `127.0.0.1:9876` over TCP instead (same framing, no relay needed). `mcp_cheatengine.py` also defaults to TCP on non-Windows hosts, so no extra configuration is required.
+
+1. Install the Python dependency (`pywin32` is skipped automatically off Windows):
+
+```bash
+python3 -m pip install -r MCP_Server/requirements.txt
+```
+
+2. In Cheat Engine, load the bridge (`File` -> `Execute Script`, or from the Lua engine):
+
+```lua
+dofile([[/path/to/cheatengine-mcp-bridge/MCP_Server/ce_mcp_bridge.lua]])
+```
+
+Look for: `[MCP v12.0.0] MCP Server Listening on: 127.0.0.1:9876 (TCP)`. To load it on every start, put that `dofile` line in a `.lua` file in Cheat Engine's `autorun` directory.
+
+3. Point your MCP client at the server:
+
+```json
+{
+  "servers": {
+    "cheatengine": {
+      "command": "python3",
+      "args": ["/path/to/cheatengine-mcp-bridge/MCP_Server/mcp_cheatengine.py"]
+    }
+  }
+}
+```
+
+To use a different port, set `CE_MCP_PORT` in both Cheat Engine's environment and the MCP server's environment (or set the Lua global `CE_MCP_PORT = 9900` before the `dofile`). On Linux the listener stays open for the rest of the Cheat Engine session: re-executing the script just swaps in the new code, and `StopMCPBridge()` makes it drop clients until the bridge is started again.
+
+Linux notes:
+- Reading another process's memory needs ptrace permission: run CE as root or set `kernel.yama.ptrace_scope = 0` (see CE's `readme-linux.txt`).
+- Windows-only features don't work on Linux: DBVM / DBK kernel tools (`get_physical_address`, DBVM watches), window and message tools (`find_window`, `send_message`, ...), SAPI speech, and anything that assumes a PE image.
 
 ### 3. Verify Connection
 Use the `ping` tool to verify connectivity:

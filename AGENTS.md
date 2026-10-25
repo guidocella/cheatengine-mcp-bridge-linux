@@ -9,14 +9,14 @@ A three-tier bridge that lets AI agents (via MCP) drive Cheat Engine to inspect 
 ## Commands
 
 ```bash
-# Install Python deps (Windows only — uses pywin32)
+# Install Python deps (pywin32 is only installed on Windows)
 pip install -r MCP_Server/requirements.txt
 
 # Integration test suite (requires: CE running, ce_mcp_bridge.lua loaded, a process attached)
 python MCP_Server/test_mcp.py
 ```
 
-Loading the Lua side in Cheat Engine: `File -> Execute Script -> open MCP_Server/ce_mcp_bridge.lua -> Execute`. Some CE builds expose this through `Table -> Show Cheat Table Lua Script`; in that case execute `dofile([[C:\path\to\cheatengine-mcp-bridge\MCP_Server\ce_mcp_bridge.lua]])` instead of pasting the full bridge. Success log: `[MCP v12.0.0] MCP Server Listening on: CE_MCP_Bridge_v99`. Re-executing the script auto-calls `StopMCPBridge` / `cleanupZombieState` first, so reloading is safe.
+Loading the Lua side in Cheat Engine: `File -> Execute Script -> open MCP_Server/ce_mcp_bridge.lua -> Execute`. Some CE builds expose this through `Table -> Show Cheat Table Lua Script`; in that case execute `dofile([[C:\path\to\cheatengine-mcp-bridge\MCP_Server\ce_mcp_bridge.lua]])` instead of pasting the full bridge. Success log: `[MCP v12.0.0] MCP Server Listening on: CE_MCP_Bridge_v99` (on Linux: `127.0.0.1:9876 (TCP)`). Re-executing the script auto-calls `StopMCPBridge` / `cleanupZombieState` first, so reloading is safe.
 
 There is **no build step, no linter, and no unit-test harness**. `test_mcp.py` is a single end-to-end script that talks to the live Named Pipe; running a "single test" means editing the `all_tests` dict in `test_mcp.py:main` or commenting out sections.
 
@@ -67,12 +67,12 @@ Two files are the source of truth — there's no codegen, so you must edit both:
 
 ## Environment & safety constraints
 
-- **Windows only.** Named Pipe access via `pywin32`; no plans for cross-platform.
+- **Platforms.** On Windows the transport is the Named Pipe (via `pywin32`). On the native Linux CE build (`getOperatingSystem() ~= 0`) the Lua bridge listens on TCP `127.0.0.1:9876` instead and `mcp_cheatengine.py` defaults to `CE_MCP_TRANSPORT=tcp` off Windows. `CE_MCP_TRANSPORT` / `CE_MCP_PORT` (env vars or Lua globals) override both sides. The Linux TCP listener deliberately persists across script reloads in `_G.__CE_MCP_SOCKET_SERVERS` (Linux won't wake a blocked `accept`/`recv` when the socket is destroyed from another thread, and doing so crashes CE); reloading swaps `server.handler`. CE's socket `readBytes` returns zero-filled data instead of `nil` after the peer closes, so a zero-length frame is treated as EOF.
 - **Cheat Engine prerequisite**: CE → Settings → Extra → **disable "Query memory region routines"**. With it enabled, memory scans on DBVM-protected pages trigger `CLOCK_WATCHDOG_TIMEOUT` BSODs. This is documented as a hard requirement in both `README.md` and `AI_Context/AI_Guide_MCP_Server_Implementation.md`; don't weaken the assumption without testing.
 - **Pipe name** `\\.\pipe\CE_MCP_Bridge_v99` is hardcoded in both `mcp_cheatengine.py` (as `PIPE_NAME`) and `ce_mcp_bridge.lua` (as `PIPE_NAME`). Keep them in sync if you ever rename it. The `_v99` suffix is the wire-protocol version and is independent of the bridge version (`12.0.0`).
 - **Codex config:** use TOML, not JSON. Add `[mcp_servers.cheatengine]`, `command = "python"`, and `args = ['C:\path\to\MCP_Server\mcp_cheatengine.py']`. Use TOML single-quoted strings for Windows paths so backslashes are literal, then restart Codex and verify with the `ping` tool.
 - **Anti-cheat safety** (per `AI_Context/AI_Guide_MCP_Server_Implementation.md`): prefer hardware DR0–DR3 breakpoints over software (`0xCC`) breakpoints, and prefer DBVM watches for truly invisible tracing. The existing `cmd_set_breakpoint` already uses `debug_setBreakpoint` (hardware); keep new debugging tools on that path.
-- **Env vars:** `CE_MCP_TIMEOUT` (default 30s) limits per-tool latency; `CE_MCP_ALLOW_SHELL=1` enables `run_command` / `shell_execute` (default: disabled).
+- **Env vars:** `CE_MCP_TIMEOUT` (default 30s) limits per-tool latency; `CE_MCP_ALLOW_SHELL=1` enables `run_command` / `shell_execute` (default: disabled); `CE_MCP_TRANSPORT` (`pipe`/`tcp`), `CE_MCP_HOST`, `CE_MCP_PORT` (default 9876) select the transport. `test_mcp.py` honors the same transport vars.
 
 ## Conventions (v12 overhaul)
 

@@ -162,8 +162,13 @@ CE_MCP_TIMEOUT_SECONDS = _parse_timeout_seconds(os.environ.get("CE_MCP_TIMEOUT")
 
 
 def _parse_transport(raw_value):
-    """Parse CE_MCP_TRANSPORT; defaults to Windows named pipe."""
-    transport = (raw_value or "pipe").strip().lower()
+    """Parse CE_MCP_TRANSPORT; defaults to the named pipe on Windows and TCP elsewhere.
+
+    Named pipes only exist on Windows; the native Linux/macOS builds of Cheat Engine
+    run ce_mcp_bridge.lua with a localhost TCP listener instead.
+    """
+    default = "pipe" if sys.platform == "win32" else "tcp"
+    transport = (raw_value or default).strip().lower() or default
     aliases = {
         "named_pipe": "pipe",
         "named-pipe": "pipe",
@@ -388,7 +393,7 @@ class CETcpBridgeClient(CEBridgeClient):
         return self.sock is not None
 
     def connect(self):
-        """Attempts to connect to the TCP relay."""
+        """Attempts to connect to the bridge's TCP listener (or the TCP relay)."""
         try:
             connect_timeout = self.timeout_seconds if self.timeout_seconds is not None else None
             self.sock = socket.create_connection((self.host, self.port), timeout=connect_timeout)
@@ -399,11 +404,11 @@ class CETcpBridgeClient(CEBridgeClient):
             return False
 
     def _endpoint_description(self):
-        return f"Cheat Engine Bridge TCP relay ({self.host}:{self.port})"
+        return f"Cheat Engine Bridge TCP ({self.host}:{self.port})"
 
     def _communication_error(self, error):
         if isinstance(error, OSError):
-            return ConnectionError(f"TCP relay communication failed: {error}")
+            return ConnectionError(f"TCP communication failed: {error}")
         return error
 
     def _read_exact(self, size):
@@ -412,13 +417,13 @@ class CETcpBridgeClient(CEBridgeClient):
         while remaining > 0:
             chunk = self.sock.recv(remaining)
             if not chunk:
-                raise ConnectionError("Connection closed while reading from TCP relay.")
+                raise ConnectionError("Connection closed while reading from CE TCP socket.")
             chunks.append(chunk)
             remaining -= len(chunk)
         return b"".join(chunks)
 
     def _exchange_once(self, req_json):
-        """Send one framed request to the TCP relay and parse one response."""
+        """Send one framed request over TCP and parse one response."""
         header = struct.pack('<I', len(req_json))
         self.sock.sendall(header + req_json)
 
@@ -440,7 +445,7 @@ class CETcpBridgeClient(CEBridgeClient):
 
 def _create_bridge_client():
     if CE_MCP_TRANSPORT == "tcp":
-        debug_log(f"Using TCP relay transport at {CE_MCP_HOST}:{CE_MCP_PORT}")
+        debug_log(f"Using TCP transport at {CE_MCP_HOST}:{CE_MCP_PORT}")
         return CETcpBridgeClient(CE_MCP_HOST, CE_MCP_PORT)
     debug_log("Using Windows named pipe transport")
     return CENamedPipeBridgeClient()
